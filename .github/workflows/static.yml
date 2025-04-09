@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple WebCraft</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden; /* Hide scrollbars */
+            background-color: #87ceeb; /* Sky blue */
+        }
+        canvas {
+            display: block; /* Remove extra space below canvas */
+        }
+        #crosshair {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 24px;
+            font-family: monospace;
+            text-shadow: 1px 1px 2px black;
+            pointer-events: none; /* Allow clicking through the crosshair */
+            z-index: 10;
+        }
+        #info {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            color: white;
+            background-color: rgba(0,0,0,0.5);
+            padding: 5px;
+            font-family: sans-serif;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div id="crosshair">+</div>
+    <div id="info">
+        W/A/S/D: Move | Space: Jump | Mouse: Look | Click to Lock<br>
+        NOTE: Very basic demo. Naive meshing = slow!
+    </div>
+    <canvas id="game-canvas"></canvas>
+
+    <!-- Use ES Module Shims for import maps if needed, but direct CDN module import is simpler -->
+    <script type="importmap">
+        {
+          "imports": {
+            "three": "https://unpkg.com/three@0.164.1/build/three.module.js",
+            "three/addons/controls/PointerLockControls.js": "https://unpkg.com/three@0.164.1/examples/jsm/controls/PointerLockControls.js"
+          }
+        }
+      </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+
+        // --- Constants ---
+        const CHUNK_SIZE_X = 16;
+        const CHUNK_SIZE_Y = 128; // Reduced height for performance
+        const CHUNK_SIZE_Z = 16;
+        const WORLD_CHUNKS_X = 6; // Smaller world for demo performance
+        const WORLD_CHUNKS_Z = 6;
+
+        const GRAVITY = -30;
+        const JUMP_VELOCITY = 10;
+        const MOVE_SPEED = 5; // Adjusted for potentially slower frame rates
+
+        const PLAYER_HEIGHT = 1.7;
+        const PLAYER_WIDTH = 0.6;
+        const PLAYER_EYE_OFFSET = 1.6; // How far eyes are from feet
+
+        // --- Block Definitions (Simple) ---
+        const BLOCKS = {
+            AIR: 0,
+            GRASS: 1,
+            DIRT: 2,
+            STONE: 3,
+            SAND: 4,
+            WATER: 5, // Basic placeholder
+        };
+
+        const BLOCK_COLORS = {
+            [BLOCKS.GRASS]: 0x559944,
+            [BLOCKS.DIRT]: 0x885522,
+            [BLOCKS.STONE]: 0x888888,
+            [BLOCKS.SAND]: 0xFFFFCC,
+            [BLOCKS.WATER]: 0x4488FF,
+        };
+
+        const BLOCK_SOLID = {
+            [BLOCKS.AIR]: false,
+            [BLOCKS.GRASS]: true,
+            [BLOCKS.DIRT]: true,
+            [BLOCKS.STONE]: true,
+            [BLOCKS.SAND]: true,
+            [BLOCKS.WATER]: false, // Water isn't solid for movement
+        }
+
+        // --- Global Variables ---
+        let scene, camera, renderer, controls;
+        let world;
+        let player;
+        let clock = new THREE.Clock();
+
+        const keyboardState = {};
+        const velocity = new THREE.Vector3();
+        const moveDirection = new THREE.Vector3(); // For movement calculation
+
+        // --- World Generation (Very Basic) ---
+        // Simple placeholder noise - NOT Perlin/Simplex
+        function simpleNoise2D(x, z) {
+            // Combine some sine waves for basic variation
+             const scale = 0.05;
+             const heightScale = 15;
+             const baseHeight = 30;
+             let val = Math.sin(x * scale) * Math.cos(z * scale * 0.7);
+             val += Math.sin(x * scale * 2.1 + 5) * 0.5;
+             val += Math.cos(z * scale * 1.7 - 2) * 0.5;
+             return Math.floor(val * heightScale + baseHeight);
+        }
+
+        // --- World Class ---
+        class World {
+            constructor() {
+                this.chunks = {}; // Store chunk data { "x,z": Uint8Array }
+                this.chunkMeshes = new THREE.Group(); // Group to hold all chunk meshes
+                scene.add(this.chunkMeshes);
+            }
+
+            // Convert world coords to chunk coords and local coords
+            _getCoords(x, y, z) {
+                const chunkX = Math.floor(x / CHUNK_SIZE_X);
+                const chunkZ = Math.floor(z / CHUNK_SIZE_Z);
+                const localX = x - chunkX * CHUNK_SIZE_X;
+                const localY = y; // Y is global for simplicity here
+                const localZ = z - chunkZ * CHUNK_SIZE_Z;
+                return { chunkX, chunkZ, localX, localY, localZ };
+            }
+
+            // Get block ID at world coordinates
+            getBlock(x, y, z) {
+                if (y < 0 || y >= CHUNK_SIZE_Y) return BLOCKS.AIR; // Out of bounds vertically
+
+                const { chunkX, chunkZ, localX, localY, localZ } = this._getCoords(x, y, z);
+                const chunkId = `${chunkX},${chunkZ}`;
+                const chunk = this.chunks[chunkId];
+
+                if (!chunk) return BLOCKS.AIR; // Chunk not generated
+
+                const index = localY * (CHUNK_SIZE_X * CHUNK_SIZE_Z) + localZ * CHUNK_SIZE_X + localX;
+                if (index < 0 || index >= chunk.length) return BLOCKS.AIR; // Should not happen if coords are right
+
+                return chunk[index];
+            }
+
+            // Set block ID (doesn't update mesh automatically in this simple version)
+            setBlock(x, y, z, id) {
+                 if (y < 0 || y >= CHUNK_SIZE_Y) return;
+
+                const { chunkX, chunkZ, localX, localY, localZ } = this._getCoords(x, y, z);
+                const chunkId = `${chunkX},${chunkZ}`;
+                const chunk = this.chunks[chunkId];
+
+                if (!chunk) return; // Chunk not generated
+
+                const index = localY * (CHUNK_SIZE_X * CHUNK_SIZE_Z) + localZ * CHUNK_SIZE_X + localX;
+                 if (index >= 0 && index < chunk.length) {
+                     chunk[index] = id;
+                     // !!! IMPORTANT: In a real game, you'd flag this chunk
+                     // (and potentially neighbors) for a mesh update here.
+                 }
+            }
+
+             isSolid(x, y, z) {
+                 const blockId = this.getBlock(x, y, z);
+                 return BLOCK_SOLID[blockId] !== undefined ? BLOCK_SOLID[blockId] : false;
+            }
+
+
+            // Generate data for a single chunk
+            _generateChunkData(chunkX, chunkZ) {
+                const chunkData = new Uint8Array(CHUNK_SIZE_X * CHUNK_SIZE_Y * CHUNK_SIZE_Z);
+                const chunkId = `${chunkX},${chunkZ}`;
+
+                for (let ly = 0; ly < CHUNK_SIZE_Y; ly++) {
+                    for (let lz = 0; lz < CHUNK_SIZE_Z; lz++) {
+                        for (let lx = 0; lx < CHUNK_SIZE_X; lx++) {
+                            const gx = chunkX * CHUNK_SIZE_X + lx;
+                            const gz = chunkZ * CHUNK_SIZE_Z + lz;
+
+                            const surfaceY = simpleNoise2D(gx, gz);
+                            let blockType = BLOCKS.AIR;
+
+                            if (ly < surfaceY - 3) {
+                                blockType = BLOCKS.STONE;
+                            } else if (ly < surfaceY) {
+                                blockType = BLOCKS.DIRT;
+                            } else if (ly === surfaceY) {
+                                // Basic water level check
+                                if (surfaceY < 32) {
+                                     blockType = BLOCKS.SAND; // Beach near water
+                                } else {
+                                     blockType = BLOCKS.GRASS;
+                                }
+                            } else if (ly <= 31) { // Water level
+                                blockType = BLOCKS.WATER;
+                            }
+
+
+                            const index = ly * (CHUNK_SIZE_X * CHUNK_SIZE_Z) + lz * CHUNK_SIZE_X + lx;
+                            chunkData[index] = blockType;
+                        }
+                    }
+                }
+                this.chunks[chunkId] = chunkData;
+                return chunkData;
+            }
+
+            // Generate the initial world chunks and their meshes
+            generateInitialWorld() {
+                console.log("Generating world...");
+                 const centerOffset = 0; // Start generation around 0,0
+
+                for (let cx = -Math.floor(WORLD_CHUNKS_X/2); cx < Math.ceil(WORLD_CHUNKS_X/2); cx++) {
+                    for (let cz = -Math.floor(WORLD_CHUNKS_Z/2); cz < Math.ceil(WORLD_CHUNKS_Z/2); cz++) {
+                        const chunkData = this._generateChunkData(cx + centerOffset, cz + centerOffset);
+                        const chunkMesh = this._createNaiveChunkMesh(chunkData, cx + centerOffset, cz + centerOffset);
+                         if (chunkMesh) {
+                            this.chunkMeshes.add(chunkMesh);
+                         }
+                    }
+                }
+                console.log("World generation complete.");
+            }
+
+           // --- !!! NAIVE MESHING - VERY SLOW !!! ---
+           // Creates a separate cube geometry for every single block.
+           // A real implementation uses Greedy Meshing or similar.
+           _createNaiveChunkMesh(chunkData, chunkX, chunkZ) {
+                const chunkGroup = new THREE.Group(); // Use a group per chunk
+                chunkGroup.position.set(chunkX * CHUNK_SIZE_X, 0, chunkZ * CHUNK_SIZE_Z);
+
+                const neighborOffsets = [
+                    { dir: [ 0,  1,  0], face: 'top' },    // Top
+                    { dir: [ 0, -1,  0], face: 'bottom' }, // Bottom
+                    { dir: [ 1,  0,  0], face: 'right' },  // Right (+X)
+                    { dir: [-1,  0,  0], face: 'left' },   // Left (-X)
+                    { dir: [ 0,  0,  1], face: 'front' },  // Front (+Z)
+                    { dir: [ 0,  0, -1], face: 'back' },   // Back (-Z)
+                ];
+
+                // Use InstancedMesh for better (but still not great) performance with naive cubes
+                const meshes = {}; // { blockId: { positions: [], count: 0 } }
+                const maxInstances = CHUNK_SIZE_X * CHUNK_SIZE_Y * CHUNK_SIZE_Z; // Upper bound
+
+                // Pre-create basic cube geometry and materials
+                const geometry = new THREE.BoxGeometry(1, 1, 1);
+                const materials = {};
+                for (const blockId in BLOCK_COLORS) {
+                    materials[blockId] = new THREE.MeshLambertMaterial({ color: BLOCK_COLORS[blockId] });
+                }
+                materials[BLOCKS.WATER] = new THREE.MeshLambertMaterial({
+                    color: BLOCK_COLORS[BLOCKS.WATER],
+                    transparent: true,
+                    opacity: 0.7
+                });
+
+
+                for (let ly = 0; ly < CHUNK_SIZE_Y; ly++) {
+                    for (let lz = 0; lz < CHUNK_SIZE_Z; lz++) {
+                        for (let lx = 0; lx < CHUNK_SIZE_X; lx++) {
+                            const index = ly * (CHUNK_SIZE_X * CHUNK_SIZE_Z) + lz * CHUNK_SIZE_X + lx;
+                            const blockId = chunkData[index];
+
+                            if (blockId === BLOCKS.AIR) continue;
+
+                             const gx = chunkX * CHUNK_SIZE_X + lx;
+                             const gy = ly;
+                             const gz = chunkZ * CHUNK_SIZE_Z + lz;
+
+                             // Check neighbors to only add exposed faces (basic optimization)
+                             let needsMesh = false;
+                             for (const offset of neighborOffsets) {
+                                 const nx = gx + offset.dir[0];
+                                 const ny = gy + offset.dir[1];
+                                 const nz = gz + offset.dir[2];
+                                 const neighborId = this.getBlock(nx, ny, nz); // Use world getter for neighbors
+                                 if (!BLOCK_SOLID[neighborId]) { // If neighbor is air or non-solid (like water)
+                                     needsMesh = true;
+                                     break;
+                                 }
+                             }
+
+
+                             if (needsMesh) {
+                                if (!meshes[blockId]) {
+                                     // Create InstancedMesh lazily
+                                    const material = materials[blockId] || materials[BLOCKS.STONE]; // Fallback material
+                                    meshes[blockId] = {
+                                        mesh: new THREE.InstancedMesh(geometry, material, maxInstances),
+                                        count: 0,
+                                        dummy: new THREE.Object3D() // Dummy object for matrix updates
+                                    };
+                                    meshes[blockId].mesh.position.set(chunkX * CHUNK_SIZE_X, 0, chunkZ * CHUNK_SIZE_Z); // Set base position
+                                }
+
+                                if (meshes[blockId].count < maxInstances) {
+                                    const dummy = meshes[blockId].dummy;
+                                    dummy.position.set(lx + 0.5, ly + 0.5, lz + 0.5); // Position relative to chunk origin
+                                    dummy.updateMatrix();
+                                    meshes[blockId].mesh.setMatrixAt(meshes[blockId].count++, dummy.matrix);
+                                } else {
+                                    console.warn("Exceeded max instances for block type", blockId);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Add created InstancedMeshes to the scene
+                for(const blockId in meshes) {
+                    if (meshes[blockId].count > 0) {
+                         meshes[blockId].mesh.instanceMatrix.needsUpdate = true;
+                         meshes[blockId].mesh.count = meshes[blockId].count; // Set actual count
+                         //chunkGroup.add(meshes[blockId].mesh); // Add to chunk group
+                          this.chunkMeshes.add(meshes[blockId].mesh); // Add directly to world group
+                    }
+                }
+                // Return null because we added directly to world group
+                 return null; // No single mesh object returned anymore
+            }
+        }
+
+
+        // --- Player Class ---
+        class Player {
+            constructor() {
+                // Start player higher up to avoid spawning inside ground
+                this.position = new THREE.Vector3(
+                     (WORLD_CHUNKS_X * CHUNK_SIZE_X) / 2,
+                     CHUNK_SIZE_Y + 10, // Start well above max terrain height
+                     (WORLD_CHUNKS_Z * CHUNK_SIZE_Z) / 2
+                );
+                this.velocity = new THREE.Vector3();
+                this.onGround = false;
+
+                // Simple bounding box centered at feet, extending upwards
+                this.boundingBox = new THREE.Box3(
+                    new THREE.Vector3(-PLAYER_WIDTH / 2, 0, -PLAYER_WIDTH / 2),
+                    new THREE.Vector3(PLAYER_WIDTH / 2, PLAYER_HEIGHT, PLAYER_WIDTH / 2)
+                );
+            }
+
+             // Basic AABB collision detection and response
+             applyCollisionAndGravity(delta, world) {
+                 // Apply gravity
+                 this.velocity.y += GRAVITY * delta;
+
+                 // Store proposed move
+                 const deltaPosition = this.velocity.clone().multiplyScalar(delta);
+                 let proposedPos = this.position.clone().add(deltaPosition);
+
+                 this.onGround = false;
+
+                 // Collision checks - Check around the player's bounding box corners
+                 const minX = Math.floor(proposedPos.x - PLAYER_WIDTH / 2);
+                 const maxX = Math.ceil(proposedPos.x + PLAYER_WIDTH / 2);
+                 const minY = Math.floor(proposedPos.y); // Feet level
+                 const maxY = Math.ceil(proposedPos.y + PLAYER_HEIGHT);
+                 const minZ = Math.floor(proposedPos.z - PLAYER_WIDTH / 2);
+                 const maxZ = Math.ceil(proposedPos.z + PLAYER_WIDTH / 2);
+
+                 for (let y = minY; y < maxY; y++) {
+                     for (let x = minX; x < maxX; x++) {
+                         for (let z = minZ; z < maxZ; z++) {
+                             if (world.isSolid(x, y, z)) {
+                                 const blockBox = new THREE.Box3(
+                                     new THREE.Vector3(x, y, z),
+                                     new THREE.Vector3(x + 1, y + 1, z + 1)
+                                 );
+
+                                 // Check X collision
+                                 const playerBoxX = this.boundingBox.clone().translate(new THREE.Vector3(proposedPos.x, this.position.y, this.position.z));
+                                 if (playerBoxX.intersectsBox(blockBox)) {
+                                     // Collision on X-axis
+                                     this.velocity.x = 0;
+                                     // Adjust position slightly away from collision side
+                                     proposedPos.x = this.position.x; // Revert X proposal
+                                 }
+
+                                 // Check Z collision
+                                 const playerBoxZ = this.boundingBox.clone().translate(new THREE.Vector3(this.position.x, this.position.y, proposedPos.z));
+                                  if (playerBoxZ.intersectsBox(blockBox)) {
+                                     // Collision on Z-axis
+                                     this.velocity.z = 0;
+                                      proposedPos.z = this.position.z; // Revert Z proposal
+                                 }
+
+                                  // Check Y collision - IMPORTANT: Do this last or separately
+                                 const playerBoxY = this.boundingBox.clone().translate(new THREE.Vector3(this.position.x, proposedPos.y, this.position.z)); // Use current X/Z for Y check
+                                 if (playerBoxY.intersectsBox(blockBox)) {
+                                     // Check if falling onto the block
+                                     if (this.velocity.y < 0 && proposedPos.y < this.position.y) {
+                                         this.velocity.y = 0;
+                                         proposedPos.y = y + 1; // Place feet exactly on top
+                                         this.onGround = true;
+                                     }
+                                     // Check if hitting head while jumping up
+                                     else if (this.velocity.y > 0 && proposedPos.y > this.position.y) {
+                                         this.velocity.y = 0;
+                                         proposedPos.y = y - PLAYER_HEIGHT; // Place head just below
+                                     }
+                                 }
+                             }
+                         }
+                     }
+                 }
+
+                 // Update position with potentially adjusted proposedPos
+                 this.position.copy(proposedPos);
+
+                 // Prevent falling through floor (failsafe)
+                 if (this.position.y < 0) {
+                     this.position.y = 0;
+                     this.velocity.y = 0;
+                     this.onGround = true;
+                 }
+             }
+
+            update(delta, world) {
+                 this.applyCollisionAndGravity(delta, world);
+                 // Damping (friction) - Reduce X/Z velocity over time
+                 this.velocity.x *= Math.pow(0.1, delta); // Faster damping
+                 this.velocity.z *= Math.pow(0.1, delta);
+            }
+        }
+
+        // --- Initialization Function ---
+        function init() {
+            // Renderer
+            renderer = new THREE.WebGLRenderer({ canvas: document.getElementById('game-canvas') });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+
+            // Scene
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x87ceeb); // Sky Blue
+            scene.fog = new THREE.Fog(0x87ceeb, 0, CHUNK_SIZE_X * WORLD_CHUNKS_X * 0.6); // Add fog based on world size
+
+            // Camera
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+
+            // Lighting
+            const ambientLight = new THREE.AmbientLight(0xcccccc);
+            scene.add(ambientLight);
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 0.6);
+            directionalLight.position.set(1, 1, 0.5).normalize();
+            scene.add(directionalLight);
+
+            // Controls (Pointer Lock)
+            controls = new PointerLockControls(camera, renderer.domElement);
+            scene.add(controls.getObject()); // Add camera holder to scene
+
+            // Event listener to lock pointer on click
+            renderer.domElement.addEventListener('click', () => {
+                controls.lock();
+            });
+
+            controls.addEventListener('lock', () => console.log('Pointer locked'));
+            controls.addEventListener('unlock', () => console.log('Pointer unlocked'));
+
+
+            // Input Listeners
+            document.addEventListener('keydown', (event) => { keyboardState[event.code] = true; });
+            document.addEventListener('keyup', (event) => { keyboardState[event.code] = false; });
+
+            // World and Player
+            world = new World(); // Creates chunks map and mesh group
+            world.generateInitialWorld(); // Generate data and initial meshes
+
+            player = new Player();
+
+            // Set initial camera position based on player start
+            controls.getObject().position.copy(player.position);
+            controls.getObject().position.y += PLAYER_EYE_OFFSET;
+
+
+            // Handle window resize
+            window.addEventListener('resize', onWindowResize, false);
+
+            // Start the game loop
+            animate();
+        }
+
+        // --- Handle Window Resize ---
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // --- Input Processing ---
+        function handleInput(delta) {
+            if (!controls.isLocked) return;
+
+            const speed = MOVE_SPEED * delta * 60; // Scale speed by delta relative to 60fps
+
+            // Reset velocity influence from previous frame input
+             velocity.x = 0;
+             velocity.z = 0;
+
+            moveDirection.z = Number(keyboardState['KeyW']) - Number(keyboardState['KeyS']);
+            moveDirection.x = Number(keyboardState['KeyD']) - Number(keyboardState['KeyA']);
+            moveDirection.normalize(); // Ensures consistent speed diagonally
+
+            if (keyboardState['KeyW'] || keyboardState['KeyS']) {
+                 velocity.z = moveDirection.z * speed;
+             }
+             if (keyboardState['KeyA'] || keyboardState['KeyD']) {
+                 velocity.x = moveDirection.x * speed;
+             }
+
+             // Apply movement based on camera direction
+             controls.moveRight(velocity.x * delta); // Use controls' built-in movement relative to view
+             controls.moveForward(velocity.z * delta); //
+
+             // Apply accumulated movement velocity to the player physics simulation
+             player.velocity.add(controls.getObject().getWorldDirection(new THREE.Vector3()).multiplyScalar(velocity.z * delta));
+             player.velocity.add(new THREE.Vector3(1, 0, 0).applyQuaternion(controls.getObject().quaternion).multiplyScalar(velocity.x * delta));
+
+
+            // Jumping
+            if (keyboardState['Space'] && player.onGround) {
+                player.velocity.y = JUMP_VELOCITY;
+            }
+
+             // Directly update player velocity based on controlled movement
+             // Get forward and right vectors relative to the camera
+            const forward = new THREE.Vector3();
+            const right = new THREE.Vector3();
+            controls.getObject().getWorldDirection(forward);
+            right.crossVectors(controls.getObject().up, forward).normalize(); // Get right vector
+
+            // Apply movement relative to camera direction directly to velocity for physics step
+            const moveForce = speed * 15; // Apply as a force impulse
+            if (keyboardState['KeyW'] || keyboardState['KeyS']) {
+                 player.velocity.addScaledVector(forward, moveDirection.z * moveForce * delta);
+            }
+             if (keyboardState['KeyA'] || keyboardState['KeyD']) {
+                  player.velocity.addScaledVector(right, moveDirection.x * moveForce * delta);
+            }
+
+        }
+
+
+        // --- Game Loop ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+
+            handleInput(delta);
+
+            // Update player physics (gravity, collisions)
+            if (player) {
+                player.update(delta, world);
+
+                // Update camera position to follow player's feet + eye offset
+                 if (controls.isLocked) { // Only update camera if controls are active
+                     controls.getObject().position.copy(player.position);
+                     controls.getObject().position.y += PLAYER_EYE_OFFSET;
+                 }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // --- Start Everything ---
+        init();
+
+    </script>
+</body>
+</html>
